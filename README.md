@@ -1,7 +1,6 @@
 # go-message
 
-[![godocs.io](https://godocs.io/github.com/emersion/go-message?status.svg)](https://godocs.io/github.com/emersion/go-message)
-[![builds.sr.ht status](https://builds.sr.ht/~emersion/go-message/commits.svg)](https://builds.sr.ht/~emersion/go-message/commits?)
+[![Go Reference](https://pkg.go.dev/badge/github.com/emersion/go-message.svg)](https://pkg.go.dev/github.com/emersion/go-message)
 
 This is a fork of `github.com/emersion/go-message` with some changes to handle some problems seen in real world email.
 
