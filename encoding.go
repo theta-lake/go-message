@@ -9,8 +9,6 @@ import (
 	mimeqp "mime/quotedprintable"
 	"strings"
 	"sync"
-
-	"github.com/emersion/go-textwrapper"
 )
 
 var (
