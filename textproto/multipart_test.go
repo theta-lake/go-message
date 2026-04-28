@@ -7,6 +7,7 @@ package textproto
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -284,7 +285,7 @@ Oh no, premature EOF!
 		t.Fatalf("didn't get a part")
 	}
 	_, err = io.Copy(ioutil.Discard, part)
-	if err != io.ErrUnexpectedEOF {
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("expected error io.ErrUnexpectedEOF; got %v", err)
 	}
 }
@@ -851,5 +852,425 @@ func TestNoBoundary(t *testing.T) {
 	_, err := mr.NextPart()
 	if got, want := fmt.Sprint(err), "multipart: boundary is empty"; got != want {
 		t.Errorf("NextPart error = %v; want %v", got, want)
+	}
+}
+
+// TestMissingBoundaryCloseTrailingCRLF verifies that when the multipart
+// input ends without a closing "--boundary--" delimiter, trailing bytes of
+// the part body (including a final CRLF) are still delivered to the caller
+// rather than silently truncated.
+func TestMissingBoundaryCloseTrailingCRLF(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if want := []byte("hello\r\n"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+}
+
+// TestMissingBoundaryCloseNoTrailingNewline verifies that body bytes with no
+// trailing newline are also delivered when the closing boundary is absent.
+func TestMissingBoundaryCloseNoTrailingNewline(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if want := []byte("hello"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+}
+
+// TestNextPartEOFWraps verifies that NextPart wraps the underlying read
+// error using %w so errors.Is identity is preserved through the wrap. After
+// the previous part's body is fully drained, the bufReader is empty and the
+// next ReadSlice returns plain io.EOF (not io.ErrUnexpectedEOF). The wrapped
+// error must still satisfy errors.Is(err, io.EOF). This exercises the change
+// from fmt.Errorf("...: %v", err) to "...: %w", err.
+func TestNextPartEOFWraps(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	if _, err := io.ReadAll(part); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("first part read err = %v; want io.ErrUnexpectedEOF", err)
+	}
+	_, err = r.NextPart()
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("second NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+}
+
+// TestMissingBoundaryCloseDashDashOnlyBody covers the total == 0 EOF-flush
+// branch of scanUntilBoundary. With boundary "A", dashBoundary is "--A".
+// A part body of exactly "--" (a strict prefix of dashBoundary) followed by
+// EOF must be flushed as body bytes rather than held back waiting for a
+// boundary that never arrives.
+func TestMissingBoundaryCloseDashDashOnlyBody(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"--"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if want := []byte("--"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+}
+
+// TestTrailingExactDashBoundaryRecognizedAtEOF guards a pre-existing parser
+// behavior against accidental capture by the new EOF-flush branches: when
+// the buffer at EOF is exactly "\r\n--A" (no trailing "--"), matchAfterPrefix
+// returns +1 because len(buf) == len(prefix) and readErr != nil, so the
+// existing boundary-detection path consumes those bytes as a boundary match.
+func TestTrailingExactDashBoundaryRecognizedAtEOF(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n--A"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if err != nil {
+		t.Errorf("io.ReadAll: %v; want nil", err)
+	}
+	if want := []byte("hello"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	_, err = r.NextPart()
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("second NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+}
+
+// TestMissingBoundaryCloseLFOnly verifies the missing-close fix in the
+// LF-only line-ending mode. The parser auto-switches to "\n--boundary"
+// (no CR) when the opening boundary line ends in just "\n".
+func TestMissingBoundaryCloseLFOnly(t *testing.T) {
+	body := "--A\n" +
+		"Content-Type: text/plain\n" +
+		"\n" +
+		"hello\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if want := []byte("hello\n"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+}
+
+// TestMissingBoundaryCloseInnerNested verifies the fix at an inner level
+// when wrapped by a well-formed outer multipart. The outer multipart has a
+// proper closing "--OUTER--", but its single child (itself a multipart with
+// boundary INNER) lacks "--INNER--". Reading the inner text/plain part's
+// body must surface the joined io.ErrUnexpectedEOF + ErrMissingBoundaryClose
+// error, and the next inner NextPart call must return a wrapped io.EOF.
+func TestMissingBoundaryCloseInnerNested(t *testing.T) {
+	body := "--OUTER\r\n" +
+		"Content-Type: multipart/mixed; boundary=INNER\r\n" +
+		"\r\n" +
+		"--INNER\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"nested\r\n" +
+		"\r\n--OUTER--\r\n"
+	outer := NewMultipartReader(strings.NewReader(body), "OUTER")
+	outerPart, err := outer.NextPart()
+	if err != nil {
+		t.Fatalf("outer NextPart: %v", err)
+	}
+	inner := NewMultipartReader(outerPart, "INNER")
+	innerPart, err := inner.NextPart()
+	if err != nil {
+		t.Fatalf("inner NextPart: %v", err)
+	}
+	got, err := io.ReadAll(innerPart)
+	if want := []byte("nested\r\n"); !bytes.Equal(got, want) {
+		t.Errorf("inner body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+	_, err = inner.NextPart()
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("second inner NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+}
+
+// TestNextPartStickyAfterMissingClose verifies that once NextPart has
+// surfaced an error from the underlying parser, the sticky termination
+// kicks in and subsequent calls return the bare io.EOF sentinel without
+// re-entering the parser. The first errored call still returns the parser's
+// own error verbatim (here a fmt-wrapped io.EOF from the bufReader hitting
+// EOF without seeing a final boundary line), satisfying errors.Is.
+func TestNextPartStickyAfterMissingClose(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if want := []byte("hello\r\n"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+	if _, err := r.NextPart(); !errors.Is(err, io.EOF) {
+		t.Errorf("second NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("third NextPart err = %v; want bare io.EOF (sticky termination)", err)
+	}
+}
+
+// TestNextPartEmptyBoundaryNotSticky verifies that an empty-boundary
+// configuration error is NOT sticky: it is a non-EOF error, so the same
+// error is returned on every call. The sticky termination only engages
+// for EOF-class errors where the underlying stream is unrecoverable.
+func TestNextPartEmptyBoundaryNotSticky(t *testing.T) {
+	r := NewMultipartReader(strings.NewReader(""), "")
+	for i := 0; i < 3; i++ {
+		_, err := r.NextPart()
+		if got, want := fmt.Sprint(err), "multipart: boundary is empty"; got != want {
+			t.Errorf("call %d: NextPart err = %v; want %v", i+1, got, want)
+		}
+	}
+}
+
+// TestNextPartStickyAfterCleanEOF verifies that the sticky-done logic does
+// not interfere with the well-formed end-of-iteration path: after the normal
+// io.EOF, subsequent calls continue to return io.EOF.
+func TestNextPartStickyAfterCleanEOF(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n" +
+		"--A--\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, err := io.ReadAll(part)
+	if err != nil {
+		t.Errorf("io.ReadAll: %v; want nil", err)
+	}
+	if want := []byte("hello"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("second NextPart err = %v; want io.EOF", err)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("third NextPart err = %v; want io.EOF", err)
+	}
+}
+
+// TestNextPartStickyEngagesMidIteration covers sticky engagement on a
+// NextPart call after an earlier part was read cleanly. An earlier part's
+// clean read must not pre-arm sticky, but a later EOF-class error must.
+func TestNextPartStickyEngagesMidIteration(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"first\r\n" +
+		"--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"second\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+
+	part1, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("first NextPart: %v", err)
+	}
+	got1, err := io.ReadAll(part1)
+	if err != nil {
+		t.Errorf("part1 io.ReadAll err = %v; want nil", err)
+	}
+	if want := []byte("first"); !bytes.Equal(got1, want) {
+		t.Errorf("part1 body = %q; want %q", got1, want)
+	}
+
+	part2, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("second NextPart: %v", err)
+	}
+	got2, err := io.ReadAll(part2)
+	if want := []byte("second\r\n"); !bytes.Equal(got2, want) {
+		t.Errorf("part2 body = %q; want %q", got2, want)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+
+	if _, err := r.NextPart(); !errors.Is(err, io.EOF) {
+		t.Errorf("third NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("fourth NextPart err = %v; want bare io.EOF (sticky engaged)", err)
+	}
+}
+
+// TestNextPartStickyDoesNotPoisonPriorPart confirms that the sticky done
+// flag lives on MultipartReader, not on *Part: after sticky termination has
+// engaged on the reader, calling Read on a previously-returned *Part still
+// idempotently surfaces that part's terminal error rather than being
+// hijacked by the reader-level short-circuit.
+func TestNextPartStickyDoesNotPoisonPriorPart(t *testing.T) {
+	body := "--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+	part, err := r.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	got, readErr := io.ReadAll(part)
+	if want := []byte("hello\r\n"); !bytes.Equal(got, want) {
+		t.Errorf("body bytes = %q; want %q", got, want)
+	}
+	if !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(readErr, io.ErrUnexpectedEOF) = false; err = %v", readErr)
+	}
+	if !errors.Is(readErr, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(readErr, ErrMissingBoundaryClose) = false; err = %v", readErr)
+	}
+
+	// Drive sticky termination on the MultipartReader: the first call after
+	// a malformed end returns a wrapped EOF (which engages sticky); the
+	// second returns bare io.EOF via the short-circuit.
+	if _, err := r.NextPart(); !errors.Is(err, io.EOF) {
+		t.Fatalf("second NextPart err = %v; errors.Is(err, io.EOF) = false", err)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Fatalf("third NextPart err = %v; want bare io.EOF (sticky engaged)", err)
+	}
+
+	// Reading the originally-returned *Part again must still surface the
+	// previously observed terminal error, proving done is on MultipartReader,
+	// not on *Part.
+	buf := make([]byte, 8)
+	n, err := part.Read(buf)
+	if n != 0 {
+		t.Errorf("part.Read after sticky: n = %d; want 0", n)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("errors.Is(err, io.ErrUnexpectedEOF) = false; err = %v", err)
+	}
+	if !errors.Is(err, ErrMissingBoundaryClose) {
+		t.Errorf("errors.Is(err, ErrMissingBoundaryClose) = false; err = %v", err)
+	}
+}
+
+// TestNextPartRecoversAfterMalformedHeader verifies that non-EOF errors do
+// NOT engage sticky termination: the parser walks forward through malformed
+// content, surfacing distinct non-EOF errors per call, until it eventually
+// reaches the closing boundary and returns bare io.EOF (engaging sticky).
+//
+// Specific error messages from the parser state machine are intentionally
+// not asserted; the test only verifies structural facts (each errored call
+// before the final EOF is non-nil and not EOF-class, then a bare io.EOF,
+// then sticky stays engaged).
+func TestNextPartRecoversAfterMalformedHeader(t *testing.T) {
+	body := "--A\r\n" +
+		"--A\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"recovered\r\n" +
+		"--A--\r\n"
+	r := NewMultipartReader(strings.NewReader(body), "A")
+
+	const maxIters = 10
+	var firstEOFAt = -1
+	for i := 0; i < maxIters; i++ {
+		_, err := r.NextPart()
+		if err == nil {
+			t.Fatalf("iter %d: NextPart err = nil; expected a parser error or io.EOF", i)
+		}
+		if err == io.EOF {
+			firstEOFAt = i
+			break
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("iter %d: NextPart err = %v; sticky engaged before reaching closing boundary", i, err)
+		}
+	}
+	if firstEOFAt < 0 {
+		t.Fatalf("never reached io.EOF within %d iterations; parser failed to make forward progress", maxIters)
+	}
+	if firstEOFAt < 1 {
+		t.Errorf("reached io.EOF on iter %d; expected at least one non-EOF error first to prove forward progress", firstEOFAt)
+	}
+
+	// Sticky must stay engaged on subsequent calls.
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("post-EOF NextPart err = %v; want bare io.EOF (sticky engaged)", err)
 	}
 }
