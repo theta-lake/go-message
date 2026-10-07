@@ -8,6 +8,8 @@ import (
 	"net/textproto"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type headerField struct {
@@ -433,6 +435,31 @@ func validHeaderKeyByte(b byte) bool {
 	return c >= 33 && c <= 126 && c != ':'
 }
 
+// validHeaderKey extends RFC 5322 field names to tolerate UTF-8 letters, marks
+// and numbers seen in the wild (e.g. "X-Telef\u00f3nica-Campaign"). The key must
+// start with an ASCII byte so an unindented continuation line is not mistaken
+// for a header. Invisible, spacing, punctuation and symbol runes are rejected.
+func validHeaderKey(k []byte) bool {
+	if len(k) > 0 && k[0] >= utf8.RuneSelf {
+		return false
+	}
+	for len(k) > 0 {
+		if k[0] < utf8.RuneSelf {
+			if !validHeaderKeyByte(k[0]) {
+				return false
+			}
+			k = k[1:]
+			continue
+		}
+		r, size := utf8.DecodeRune(k)
+		if r == utf8.RuneError || !unicode.In(r, unicode.L, unicode.M, unicode.N) {
+			return false
+		}
+		k = k[size:]
+	}
+	return true
+}
+
 // trim returns s with leading and trailing spaces and tabs removed.
 // It does not assume Unicode or UTF-8.
 func trim(s []byte) []byte {
@@ -558,10 +585,8 @@ func ReadHeader(r *bufio.Reader) (Header, error) {
 
 		// Verify that there are no invalid characters in the header key.
 		// See RFC 5322 Section 2.2
-		for _, c := range keyBytes {
-			if !validHeaderKeyByte(c) {
-				return newHeader(fs), fmt.Errorf("message: malformed MIME header key: %v", string(keyBytes))
-			}
+		if !validHeaderKey(keyBytes) {
+			return newHeader(fs), fmt.Errorf("message: malformed MIME header key: %v", string(keyBytes))
 		}
 
 		key := textproto.CanonicalMIMEHeaderKey(string(keyBytes))

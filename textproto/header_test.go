@@ -230,6 +230,60 @@ func TestInvalidHeader(t *testing.T) {
 	}
 }
 
+func TestReadHeaderNonASCIIKey(t *testing.T) {
+	accept := []struct {
+		name string
+		key  string
+	}{
+		{"latin letter", "X-Telef\u00f3nica-Campaign"},
+		{"cjk letters", "X-\u90e8\u95e8"},
+		{"combining mark", "X-Telefo\u0301nica"},
+		{"arabic-indic digit", "X-Nombre-\u0663"},
+	}
+	for _, tc := range accept {
+		t.Run("accept "+tc.name, func(t *testing.T) {
+			hdr := tc.key + ": 18\r\nTo: " + to + "\r\n\r\n"
+			h, err := ReadHeader(bufio.NewReader(strings.NewReader(hdr)))
+			if err != nil {
+				t.Fatalf("ReadHeader() returned error: %v", err)
+			}
+			if got := h.Get(tc.key); got != "18" {
+				t.Errorf("Get(%q) = %q, want %q", tc.key, got, "18")
+			}
+			if got := h.Get("To"); got != to {
+				t.Errorf("Get(To) = %q, want %q", got, to)
+			}
+		})
+	}
+
+	reject := []struct {
+		name string
+		key  string
+	}{
+		{"invalid utf-8", "X-Telef\xf3nica"},
+		{"bidi override", "X-\u202eEvil"},
+		{"zero width space", "From\u200b"},
+		{"byte order mark", "X-\ufeffFoo"},
+		{"no-break space", "X-\u00a0Foo"},
+		{"ideographic space", "X-\u3000Foo"},
+		{"fullwidth colon", "X-Foo\uff1aBar"},
+		{"replacement char", "X-\ufffd"},
+		{"private use", "X-\ue000"},
+		{"symbol", "X-\u2603"},
+		{"leading non-ascii", "\u00dcnicode"},
+		{"unindented cjk continuation", "\u6682\u505c\u94f6\u884c"},
+	}
+	for _, tc := range reject {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			hdr := tc.key + ": 18\r\n\r\n"
+			_, err := ReadHeader(bufio.NewReader(strings.NewReader(hdr)))
+			if err == nil || !strings.Contains(err.Error(), "malformed MIME header key") {
+				t.Errorf("ReadHeader() error = %v, want malformed MIME header key", err)
+			}
+		})
+	}
+}
+
 const testHeaderWithoutBody = "Received: from example.com by example.org\r\n" +
 	"Received: from localhost by example.com\r\n" +
 	"To: Taki Tachibana <taki.tachibana@example.org>\r\n" +
